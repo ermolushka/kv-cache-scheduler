@@ -1,4 +1,5 @@
 use crate::block_pool::BlockPool;
+use crate::eviction::{EvictionPolicy, LRUEviction};
 use crate::{block_pool::PoolFull, block_table::BlockTable};
 use std::collections::{HashMap, VecDeque};
 
@@ -43,6 +44,7 @@ pub struct Scheduler {
     pub running: Vec<SequenceId>,
     pub block_size: usize,
     pub next_id: i32,
+    pub eviction: LRUEviction,
 }
 
 impl Scheduler {
@@ -54,6 +56,7 @@ impl Scheduler {
             waiting: VecDeque::new(),
             running: Vec::new(),
             next_id: 0,
+            eviction: LRUEviction::new(),
         }
     }
     pub fn add_request(&mut self, tokens: Vec<TokenId>) -> SequenceId {
@@ -73,13 +76,25 @@ impl Scheduler {
                 .block_table
                 .append_token(&mut self.pool)
                 .unwrap();
+            let block_id = self
+                .sequences
+                .get(&seq_id)
+                .unwrap()
+                .block_table
+                .last_block()
+                .unwrap();
+            self.eviction.on_access(&block_id);
         }
         self.sequences.get_mut(&seq_id).unwrap().state = SequenceState::Decoding;
         self.waiting.retain(|id| id != &seq_id);
         self.running.push(seq_id);
     }
     pub fn step(&mut self) {
-        for seq_id in &self.running {
+        let running = self.running.clone();
+        for seq_id in &running {
+            if !self.running.contains(seq_id) {
+                continue;
+            }
             self.sequences
                 .get_mut(&seq_id)
                 .unwrap()
@@ -92,9 +107,62 @@ impl Scheduler {
                 .block_table
                 .append_token(&mut self.pool)
             {
-                Ok(_) => {}
-                Err(PoolFull) => panic!("PoolFull"),
+                Ok(_) => {
+                    let block_id = self
+                        .sequences
+                        .get(&seq_id)
+                        .unwrap()
+                        .block_table
+                        .last_block()
+                        .unwrap();
+                    self.eviction.on_access(&block_id);
+                }
+                Err(PoolFull) => {
+                    self.handle_pool_full();
+                    if self.running.contains(seq_id) {
+                        self.sequences
+                            .get_mut(seq_id)
+                            .unwrap()
+                            .block_table
+                            .append_token(&mut self.pool)
+                            .unwrap();
+                        let block_id = self
+                            .sequences
+                            .get(seq_id)
+                            .unwrap()
+                            .block_table
+                            .last_block()
+                            .unwrap();
+                        self.eviction.on_access(&block_id);
+                    }
+                }
             }
         }
+    }
+    pub fn handle_pool_full(&mut self) {
+        let victim_id = match self.eviction.select_victim(&self.pool) {
+            None => panic!("pool full, nothing evictable"),
+            Some(id) => id,
+        };
+        let victim_seq_id = self
+            .sequences
+            .iter()
+            .find(|(_, seq)| seq.block_table.blocks().contains(&victim_id))
+            .map(|(seq_id, _)| *seq_id)
+            .unwrap();
+        let blocks: Vec<_> = self.sequences[&victim_seq_id].block_table.blocks().to_vec();
+        for block_id in &blocks {
+            self.pool.decref(*block_id);
+            self.eviction.on_free(block_id);
+        }
+        self.sequences.get_mut(&victim_seq_id).unwrap().state = SequenceState::Waiting;
+        // clear block table
+        self.sequences
+            .get_mut(&victim_seq_id)
+            .unwrap()
+            .block_table
+            .clear();
+        self.waiting.push_back(victim_seq_id);
+        self.running.retain(|id| id != &victim_seq_id);
     }
 }

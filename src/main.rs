@@ -1,5 +1,6 @@
 mod block_pool;
 mod block_table;
+mod eviction;
 mod sequence;
 
 use block_pool::BlockPool;
@@ -66,6 +67,25 @@ fn main() {
             scheduler.sequences[&seq_a].token_ids.len()
         );
     }
+
+    println!("\n--- Phase 4: LRU Eviction ---");
+    // small pool to force eviction: 4 blocks, block_size=2
+    // seq_c uses 2 blocks (4 tokens), seq_d uses 2 blocks (4 tokens) = pool full
+    // one more step should trigger eviction
+    let mut sched = Scheduler::new(4, 2);
+    let seq_c = sched.add_request((0..4).map(TokenId).collect());
+    let seq_d = sched.add_request((0..4).map(TokenId).collect());
+    sched.prefill(seq_c);
+    sched.prefill(seq_d);
+    println!("pool full — running count: {}", sched.running.len()); // expect 2
+
+    // step will need a new block but pool is full — should evict seq_c (LRU)
+    sched.step();
+    println!(
+        "after eviction step — waiting: {}, running: {}",
+        sched.waiting.len(),
+        sched.running.len()
+    );
 }
 
 #[cfg(test)]
@@ -212,6 +232,54 @@ mod tests {
         table.append_token(&mut pool).unwrap();
         let result = table.append_token(&mut pool);
         assert!(result.is_err());
+    }
+
+    // --- Phase 4: LRU Eviction tests ---
+
+    #[test]
+    fn eviction_triggered_when_pool_full() {
+        // 4 blocks, block_size=4 — each sequence uses 1 block after prefill
+        // pool has 2 free blocks; after 2 decode steps per sequence pool fills up
+        let mut sched = Scheduler::new(4, 4);
+        let seq_a = sched.add_request((0..4).map(TokenId).collect());
+        let seq_b = sched.add_request((0..4).map(TokenId).collect());
+        sched.prefill(seq_a);
+        sched.prefill(seq_b);
+        // 4 decode steps fills remaining 2 blocks; 5th step forces eviction
+        for _ in 0..4 {
+            sched.step();
+        }
+        sched.step();
+        assert_eq!(sched.waiting.len(), 1);
+    }
+
+    #[test]
+    fn evicted_sequence_block_table_cleared() {
+        let mut sched = Scheduler::new(4, 4);
+        let seq_a = sched.add_request((0..4).map(TokenId).collect());
+        let seq_b = sched.add_request((0..4).map(TokenId).collect());
+        sched.prefill(seq_a);
+        sched.prefill(seq_b);
+        for _ in 0..4 {
+            sched.step();
+        }
+        sched.step();
+        let evicted_id = *sched.waiting.back().unwrap();
+        assert_eq!(sched.sequences[&evicted_id].block_table.len(), 0);
+    }
+
+    #[test]
+    fn evicted_blocks_returned_to_pool() {
+        let mut sched = Scheduler::new(4, 4);
+        let seq_a = sched.add_request((0..4).map(TokenId).collect());
+        let seq_b = sched.add_request((0..4).map(TokenId).collect());
+        sched.prefill(seq_a);
+        sched.prefill(seq_b);
+        for _ in 0..4 {
+            sched.step();
+        }
+        sched.step();
+        assert!(sched.running.len() > 0);
     }
 
     // --- Phase 3: Scheduler tests ---

@@ -51,6 +51,10 @@ impl BlockTable {
     pub fn blocks(&self) -> &[BlockID] {
         &self.blocks
     }
+    pub fn clear(&mut self) {
+        self.num_tokens = 0;
+        self.blocks.clear();
+    }
     pub fn fork(&mut self, pool: &mut BlockPool) -> BlockTable {
         let blocks_forked = self.blocks.clone();
         for block in &blocks_forked {

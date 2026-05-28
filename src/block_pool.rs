@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
 pub struct BlockID(pub u32);
 
 #[derive(Debug)]
