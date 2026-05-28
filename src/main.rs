@@ -1,8 +1,10 @@
 mod block_pool;
 mod block_table;
+mod sequence;
 
 use block_pool::BlockPool;
 use block_table::BlockTable;
+use sequence::{Scheduler, TokenId};
 
 fn main() {
     let mut pool = BlockPool::new(4);
@@ -26,12 +28,51 @@ fn main() {
         "shared block ref count: {}",
         pool.get_ref_count(shared_block)
     ); // expect 2
+
+    println!("\n--- Phase 3: Scheduler ---");
+    let mut scheduler = Scheduler::new(8, 2);
+
+    // enqueue two requests with different prompt lengths
+    let tokens_a: Vec<TokenId> = (0..4).map(TokenId).collect();
+    let tokens_b: Vec<TokenId> = (0..6).map(TokenId).collect();
+    let seq_a = scheduler.add_request(tokens_a);
+    let seq_b = scheduler.add_request(tokens_b);
+    println!("waiting queue length: {}", scheduler.waiting.len()); // expect 2
+
+    // prefill both
+    scheduler.prefill(seq_a);
+    scheduler.prefill(seq_b);
+    println!("running count: {}", scheduler.running.len()); // expect 2
+    println!("waiting count: {}", scheduler.waiting.len()); // expect 0
+
+    // check blocks allocated per sequence
+    let blocks_a = scheduler.sequences[&seq_a].block_table.len();
+    let blocks_b = scheduler.sequences[&seq_b].block_table.len();
+    println!(
+        "seq_a blocks: {} (expect 2 for 4 tokens, block_size=2)",
+        blocks_a
+    );
+    println!(
+        "seq_b blocks: {} (expect 3 for 6 tokens, block_size=2)",
+        blocks_b
+    );
+
+    // run 3 decode steps
+    for i in 0..3 {
+        scheduler.step();
+        println!(
+            "step {}: seq_a tokens={}",
+            i + 1,
+            scheduler.sequences[&seq_a].token_ids.len()
+        );
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use block_pool::BlockID;
+    use sequence::{Scheduler, TokenId};
 
     #[test]
     fn alloc_all_then_exhausted() {
@@ -171,5 +212,61 @@ mod tests {
         table.append_token(&mut pool).unwrap();
         let result = table.append_token(&mut pool);
         assert!(result.is_err());
+    }
+
+    // --- Phase 3: Scheduler tests ---
+
+    #[test]
+    fn add_request_enqueues_to_waiting() {
+        let mut scheduler = Scheduler::new(8, 2);
+        let tokens: Vec<TokenId> = (0..4).map(TokenId).collect();
+        scheduler.add_request(tokens);
+        assert_eq!(scheduler.waiting.len(), 1);
+        assert_eq!(scheduler.running.len(), 0);
+    }
+
+    #[test]
+    fn prefill_moves_sequence_to_running() {
+        let mut scheduler = Scheduler::new(8, 2);
+        let tokens: Vec<TokenId> = (0..4).map(TokenId).collect();
+        let seq_id = scheduler.add_request(tokens);
+        scheduler.prefill(seq_id);
+        assert_eq!(scheduler.waiting.len(), 0);
+        assert_eq!(scheduler.running.len(), 1);
+    }
+
+    #[test]
+    fn prefill_allocates_correct_blocks() {
+        let mut scheduler = Scheduler::new(8, 2);
+        let tokens: Vec<TokenId> = (0..6).map(TokenId).collect();
+        let seq_id = scheduler.add_request(tokens);
+        scheduler.prefill(seq_id);
+        // 6 tokens with block_size=2 -> 3 blocks
+        assert_eq!(scheduler.sequences[&seq_id].block_table.len(), 3);
+    }
+
+    #[test]
+    fn multiple_sequences_independent_blocks() {
+        let mut scheduler = Scheduler::new(16, 2);
+        let seq_a = scheduler.add_request((0..4).map(TokenId).collect());
+        let seq_b = scheduler.add_request((0..4).map(TokenId).collect());
+        scheduler.prefill(seq_a);
+        scheduler.prefill(seq_b);
+        // each has 2 blocks, no sharing — 4 total pool blocks used
+        assert_eq!(scheduler.sequences[&seq_a].block_table.len(), 2);
+        assert_eq!(scheduler.sequences[&seq_b].block_table.len(), 2);
+    }
+
+    #[test]
+    fn step_appends_tokens_and_allocates_blocks() {
+        let mut scheduler = Scheduler::new(16, 2);
+        let seq_id = scheduler.add_request((0..4).map(TokenId).collect());
+        scheduler.prefill(seq_id);
+        let tokens_before = scheduler.sequences[&seq_id].token_ids.len();
+        scheduler.step();
+        assert_eq!(
+            scheduler.sequences[&seq_id].token_ids.len(),
+            tokens_before + 1
+        );
     }
 }
