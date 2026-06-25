@@ -93,6 +93,11 @@ Three core concepts:
 2. **BlockTable** - per-request page table: `Vec<BlockID>` where index `i` covers tokens `[i*block_size .. (i+1)*block_size)`.
 3. **PrefixCache** - a radix trie keyed on `TokenId` sequences. On a cache hit, matched blocks are incref'd and inserted directly into the new request's block table - no allocation needed.
 
+## Roadmap
+
+- **CUDA block allocations** - manage KV cache blocks directly in GPU memory using CUDA device allocators, eliminating host↔device copies and enabling zero-copy block sharing across sequences on the same device
+- **Metal / MLX block allocations** - on Apple Silicon, allocate blocks as `MTLBuffer` objects (shared storage mode) so the GPU can access them natively without copies; optionally delegate to the MLX allocator for workloads running through that framework
+
 ## License
 
 [MIT](LICENSE)
