@@ -2,6 +2,7 @@ mod block_pool;
 mod block_table;
 mod eviction;
 mod sequence;
+mod prefix_cache;
 
 use block_pool::BlockPool;
 use block_table::BlockTable;
@@ -86,6 +87,74 @@ fn main() {
         sched.waiting.len(),
         sched.running.len()
     );
+
+    println!("\n--- Phase 5: Prefix Cache ---");
+    // 8 blocks, block_size=2
+    // Both requests share a 4-token prefix [0,1,2,3], then diverge.
+    // seq_e prefills normally; seq_f should reuse 2 blocks from the cache.
+    let mut sched5 = Scheduler::new(8, 2);
+    let prefix: Vec<TokenId> = (0..4).map(TokenId).collect();
+    let suffix_e: Vec<TokenId> = (10..12).map(TokenId).collect();
+    let suffix_f: Vec<TokenId> = (20..22).map(TokenId).collect();
+
+    let tokens_e: Vec<TokenId> = prefix.iter().chain(&suffix_e).copied().collect();
+    let tokens_f: Vec<TokenId> = prefix.iter().chain(&suffix_f).copied().collect();
+
+    let seq_e = sched5.add_request(tokens_e);
+    let seq_f = sched5.add_request(tokens_f);
+
+    sched5.prefill(seq_e);
+    println!(
+        "seq_e: {} blocks allocated (expect 3)",
+        sched5.sequences[&seq_e].block_table.len()
+    );
+
+    sched5.prefill(seq_f);
+    println!(
+        "seq_f: {} block table entries (expect 3: 2 shared + 1 new)",
+        sched5.sequences[&seq_f].block_table.len()
+    );
+    println!(
+        "physical blocks in pool: {} (expect 4: seq_e's 3 + 1 new for seq_f suffix)",
+        sched5.pool_used_blocks_physical()
+    );
+    println!(
+        "prefix hit rate: {:.0}% (expect 33%: 4 matched of 12 total prompt tokens)",
+        sched5.metrics.hit_rate() * 100.0
+    );
+
+    println!("\n--- Phase 6: Copy-on-Write ---");
+    // parent: 3 tokens, block_size=2 → b0=[0,1] full, b1=[2,_] partial
+    // Two forks share all parent blocks. step_cow on each triggers CoW on b1.
+    // Sealed block b0 stays shared; each sequence gets its own copy of b1.
+    let mut sched6 = Scheduler::new(16, 2);
+    let parent_tokens: Vec<TokenId> = (0..3).map(TokenId).collect();
+    let parent = sched6.add_request(parent_tokens);
+    sched6.prefill(parent);
+
+    let b0 = sched6.sequences[&parent].block_table.blocks()[0];
+    let b1 = sched6.sequences[&parent].block_table.blocks()[1];
+
+    let fork_a = sched6.fork_sequence(parent);
+    let fork_b = sched6.fork_sequence(parent);
+    println!("after 2 forks — b0 ref_count: {} (expect 3)", sched6.pool.get_ref_count(b0));
+    println!("after 2 forks — b1 ref_count: {} (expect 3)", sched6.pool.get_ref_count(b1));
+
+    // step_cow: parent copies b1 first (rc 3→2), fork_a copies it next (rc 2→1),
+    // fork_b ends up with the last reference and keeps b1 without copying.
+    sched6.step_cow();
+
+    let parent_last = sched6.sequences[&parent].block_table.last_block().unwrap();
+    let fork_a_last = sched6.sequences[&fork_a].block_table.last_block().unwrap();
+    let fork_b_last = sched6.sequences[&fork_b].block_table.last_block().unwrap();
+
+    println!("b0 ref_count: {} (expect 3 — sealed, still shared)", sched6.pool.get_ref_count(b0));
+    println!("b1 ref_count: {} (expect 1 — last owner kept it)", sched6.pool.get_ref_count(b1));
+    println!("all last blocks distinct: {} (expect true)", {
+        let mut ids = [parent_last, fork_a_last, fork_b_last];
+        ids.sort_by_key(|b| b.0);
+        ids[0] != ids[1] && ids[1] != ids[2]
+    });
 }
 
 #[cfg(test)]
@@ -336,5 +405,203 @@ mod tests {
             scheduler.sequences[&seq_id].token_ids.len(),
             tokens_before + 1
         );
+    }
+
+    // --- Phase 5: Prefix Cache tests ---
+
+    fn make_tokens(ids: &[i32]) -> Vec<TokenId> {
+        ids.iter().copied().map(TokenId).collect()
+    }
+
+    #[test]
+    fn shared_prefix_reuses_blocks() {
+        // seq_a prefills [0,1,2,3]; seq_b shares same prefix — should reuse 2 blocks.
+        let mut sched = Scheduler::new(8, 2);
+        let seq_a = sched.add_request(make_tokens(&[0, 1, 2, 3]));
+        let seq_b = sched.add_request(make_tokens(&[0, 1, 2, 3, 4, 5]));
+        sched.prefill(seq_a);
+        sched.prefill(seq_b);
+        // seq_b should have 3 blocks: 2 shared + 1 new
+        assert_eq!(sched.sequences[&seq_b].block_table.len(), 3);
+        // physical blocks: 2 (seq_a) + 1 new (seq_b suffix) = 3
+        assert_eq!(sched.pool_used_blocks_physical(), 3);
+    }
+
+    #[test]
+    fn shared_prefix_increfs_blocks() {
+        // The 2 shared blocks must have ref_count == 2.
+        let mut sched = Scheduler::new(8, 2);
+        let seq_a = sched.add_request(make_tokens(&[0, 1, 2, 3]));
+        let seq_b = sched.add_request(make_tokens(&[0, 1, 2, 3]));
+        sched.prefill(seq_a);
+        sched.prefill(seq_b);
+        for &block_id in sched.sequences[&seq_a].block_table.blocks() {
+            assert_eq!(sched.pool.get_ref_count(block_id), 2);
+        }
+    }
+
+    #[test]
+    fn no_prefix_match_allocates_independently() {
+        // Completely different tokens — no sharing, both allocate their own blocks.
+        let mut sched = Scheduler::new(8, 2);
+        let seq_a = sched.add_request(make_tokens(&[0, 1, 2, 3]));
+        let seq_b = sched.add_request(make_tokens(&[10, 11, 12, 13]));
+        sched.prefill(seq_a);
+        sched.prefill(seq_b);
+        assert_eq!(sched.pool_used_blocks_physical(), 4);
+    }
+
+    #[test]
+    fn prefix_hit_rate_nonzero_after_shared_prefill() {
+        let mut sched = Scheduler::new(8, 2);
+        let seq_a = sched.add_request(make_tokens(&[0, 1, 2, 3]));
+        let seq_b = sched.add_request(make_tokens(&[0, 1, 2, 3]));
+        sched.prefill(seq_a);
+        sched.prefill(seq_b);
+        assert!(sched.metrics.hit_rate() > 0.0);
+    }
+
+    #[test]
+    fn hit_rate_zero_with_no_prefix_overlap() {
+        let mut sched = Scheduler::new(8, 2);
+        let seq_a = sched.add_request(make_tokens(&[0, 1, 2, 3]));
+        let seq_b = sched.add_request(make_tokens(&[10, 11, 12, 13]));
+        sched.prefill(seq_a);
+        sched.prefill(seq_b);
+        assert_eq!(sched.metrics.hit_rate(), 0.0);
+    }
+
+    #[test]
+    fn evicted_block_invalidated_in_prefix_cache() {
+        // Pool: 2 blocks, block_size=2. seq_a fills both.
+        // step() needs a 3rd block, triggers eviction of seq_a and calls prefix_cache.evict.
+        // seq_b with the same tokens should then get 0 prefix hits.
+        let mut sched = Scheduler::new(2, 2);
+        let seq_a = sched.add_request(make_tokens(&[0, 1, 2, 3]));
+        sched.prefill(seq_a);
+        sched.step(); // pool full → evicts seq_a, invalidates its cache entries
+        assert_eq!(sched.waiting.len(), 1);
+
+        let hits_before = sched.metrics.prefix_hits;
+        let seq_b = sched.add_request(make_tokens(&[0, 1, 2, 3]));
+        sched.prefill(seq_b);
+        assert_eq!(sched.metrics.prefix_hits, hits_before);
+    }
+
+    #[test]
+    fn partial_prefix_match_only_full_blocks_reused() {
+        // block_size=4. Prefix of 6 tokens: only 1 full block (4 tokens) can be cached,
+        // the remaining 2 tokens of the second block don't complete a block — not cached.
+        let mut sched = Scheduler::new(8, 4);
+        let seq_a = sched.add_request(make_tokens(&[0, 1, 2, 3, 4, 5]));
+        let seq_b = sched.add_request(make_tokens(&[0, 1, 2, 3, 4, 5, 6, 7]));
+        sched.prefill(seq_a);
+        sched.prefill(seq_b);
+        // seq_b should hit 1 block (tokens 0-3), not 2 (tokens 4-5 were partial in seq_a).
+        assert_eq!(sched.metrics.prefix_hits, 4); // 4 tokens from 1 shared block
+    }
+
+    // --- Phase 6: Copy-on-Write tests ---
+
+    #[test]
+    fn fork_increfs_all_parent_blocks() {
+        // parent: 4 tokens → 2 full blocks. After fork, both blocks have ref_count 2.
+        let mut sched = Scheduler::new(8, 2);
+        let parent = sched.add_request(make_tokens(&[0, 1, 2, 3]));
+        sched.prefill(parent);
+        let fork_a = sched.fork_sequence(parent);
+        let _ = fork_a;
+        for &block_id in sched.sequences[&parent].block_table.blocks() {
+            assert_eq!(sched.pool.get_ref_count(block_id), 2);
+        }
+    }
+
+    #[test]
+    fn fork_appears_in_running() {
+        let mut sched = Scheduler::new(8, 2);
+        let parent = sched.add_request(make_tokens(&[0, 1, 2, 3]));
+        sched.prefill(parent);
+        let fork_a = sched.fork_sequence(parent);
+        assert!(sched.running.contains(&fork_a));
+    }
+
+    #[test]
+    fn cow_unshares_last_block_on_write() {
+        // parent: 3 tokens (b0 full, b1 partial). fork shares both blocks.
+        // After step_cow on fork only: fork's last block should be unshared (rc == 1).
+        let mut sched = Scheduler::new(8, 2);
+        let parent = sched.add_request(make_tokens(&[0, 1, 2]));
+        sched.prefill(parent);
+        // Remove parent from running so step_cow only advances the fork.
+        let fork_a = sched.fork_sequence(parent);
+        sched.running.retain(|&id| id == fork_a);
+
+        sched.step_cow();
+
+        let fork_last = sched.sequences[&fork_a].block_table.last_block().unwrap();
+        assert_eq!(sched.pool.get_ref_count(fork_last), 1);
+    }
+
+    #[test]
+    fn cow_sealed_blocks_stay_shared() {
+        // b0 is sealed (full) — CoW should not affect it. It stays shared after a step.
+        let mut sched = Scheduler::new(8, 2);
+        let parent = sched.add_request(make_tokens(&[0, 1, 2]));
+        sched.prefill(parent);
+        let b0 = sched.sequences[&parent].block_table.blocks()[0];
+        let fork_a = sched.fork_sequence(parent);
+        sched.running.retain(|&id| id == fork_a);
+
+        sched.step_cow();
+
+        assert_eq!(sched.pool.get_ref_count(b0), 2); // parent + fork_a still share b0
+    }
+
+    #[test]
+    fn multiple_forks_each_get_distinct_last_block() {
+        // 3-way fork from a partial-block parent. After step_cow, each ends up with a
+        // different last block (two CoW copies + the last holder keeps the original).
+        let mut sched = Scheduler::new(16, 2);
+        let parent = sched.add_request(make_tokens(&[0, 1, 2]));
+        sched.prefill(parent);
+        let fork_a = sched.fork_sequence(parent);
+        let fork_b = sched.fork_sequence(parent);
+
+        sched.step_cow(); // advances parent, fork_a, fork_b
+
+        let last_blocks: std::collections::HashSet<_> = [parent, fork_a, fork_b]
+            .iter()
+            .map(|id| sched.sequences[id].block_table.last_block().unwrap())
+            .collect();
+        assert_eq!(last_blocks.len(), 3); // all distinct
+    }
+
+    #[test]
+    fn cow_noop_when_block_already_exclusive() {
+        // If last block already has ref_count == 1, ensure_unshared should not allocate.
+        let mut sched = Scheduler::new(8, 2);
+        let parent = sched.add_request(make_tokens(&[0, 1, 2]));
+        sched.prefill(parent);
+        let b1_before = sched.sequences[&parent].block_table.last_block().unwrap();
+        // No fork — parent owns b1 exclusively.
+        sched.step_cow();
+        let b1_after = sched.sequences[&parent].block_table.last_block().unwrap();
+        assert_eq!(b1_before, b1_after); // same block, no copy made
+    }
+
+    #[test]
+    fn fork_then_step_cow_does_not_corrupt_parent_blocks() {
+        // Parent and fork decode one token each. Parent's block table should be unchanged
+        // except for its own last-block copy; fork's table is independent.
+        let mut sched = Scheduler::new(16, 2);
+        let parent = sched.add_request(make_tokens(&[0, 1, 2, 3])); // 2 full blocks
+        sched.prefill(parent);
+        let b0_parent = sched.sequences[&parent].block_table.blocks()[0];
+        let fork_a = sched.fork_sequence(parent);
+        let _ = fork_a;
+        sched.step_cow();
+        // b0 is sealed and must still match in both tables
+        assert_eq!(sched.sequences[&parent].block_table.blocks()[0], b0_parent);
+        assert_eq!(sched.sequences[&fork_a].block_table.blocks()[0], b0_parent);
     }
 }

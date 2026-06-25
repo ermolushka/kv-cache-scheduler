@@ -51,10 +51,52 @@ impl BlockTable {
     pub fn blocks(&self) -> &[BlockID] {
         &self.blocks
     }
+
+    pub fn num_tokens(&self) -> usize {
+        self.num_tokens
+    }
+    // Insert a pre-existing shared block (from prefix cache) without allocating from the pool
+    // Caller is responsible for having already incref'd the block.
+    pub fn push_full_block(&mut self, block_id: BlockID) {
+        self.blocks.push(block_id);
+        self.num_tokens += self.block_size;
+    }
+
     pub fn clear(&mut self) {
         self.num_tokens = 0;
         self.blocks.clear();
     }
+    // If the block at `slot` is shared (ref_count > 1), allocates a private copy,
+    // decrefs the old block, and updates the table entry. No-op if already exclusive.
+    pub fn ensure_unshared(&mut self, slot: usize, pool: &mut BlockPool) -> Result<BlockID, PoolFull> {
+        let block_id = self.blocks[slot];
+        if pool.get_ref_count(block_id) > 1 {
+            let new_block = pool.alloc().ok_or(PoolFull)?;
+            pool.decref(block_id);
+            self.blocks[slot] = new_block;
+            Ok(new_block)
+        } else {
+            Ok(block_id)
+        }
+    }
+
+    // Like append_token but triggers a CoW copy when writing into a shared last block.
+    pub fn append_token_cow(&mut self, pool: &mut BlockPool) -> Result<(), PoolFull> {
+        if self.num_tokens % self.block_size == 0 {
+            // Crossing into a new block — always unshared from birth.
+            let new_block = pool.alloc().ok_or(PoolFull)?;
+            self.blocks.push(new_block);
+            self.num_tokens += 1;
+            Ok(())
+        } else {
+            // Writing within the last block — unshare it first if needed.
+            let last_slot = self.blocks.len() - 1;
+            self.ensure_unshared(last_slot, pool)?;
+            self.num_tokens += 1;
+            Ok(())
+        }
+    }
+
     pub fn fork(&mut self, pool: &mut BlockPool) -> BlockTable {
         let blocks_forked = self.blocks.clone();
         for block in &blocks_forked {

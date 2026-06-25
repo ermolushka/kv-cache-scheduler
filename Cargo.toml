@@ -2,6 +2,13 @@
 name = "kv-cache-scheduler"
 version = "0.1.0"
 edition = "2024"
+description = "PagedAttention-style KV cache block manager for LLM inference"
+license = "MIT"
+repository = "https://github.com/ermolushka/kv-cache-scheduler"
+readme = "README.md"
+keywords = ["kv-cache", "llm", "inference", "paged-attention"]
+categories = ["data-structures", "simulation"]
 
 [dependencies]
 linked-hash-map = "0.5"
+thiserror = "1"
