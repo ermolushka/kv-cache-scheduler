@@ -95,8 +95,8 @@ Three core concepts:
 
 ## Roadmap
 
-- **CUDA block allocations** - manage KV cache blocks directly in GPU memory using CUDA device allocators, eliminating host↔device copies and enabling zero-copy block sharing across sequences on the same device
-- **Metal / MLX block allocations** - on Apple Silicon, allocate blocks as `MTLBuffer` objects (shared storage mode) so the GPU can access them natively without copies; optionally delegate to the MLX allocator for workloads running through that framework
+- [ ] **CUDA block allocations** - manage KV cache blocks directly in GPU memory using CUDA device allocators, eliminating host↔device copies and enabling zero-copy block sharing across sequences on the same device
+- [ ] **Metal / MLX block allocations** - on Apple Silicon, allocate blocks as `MTLBuffer` objects (shared storage mode) so the GPU can access them natively without copies; optionally delegate to the MLX allocator for workloads running through that framework
 
 ## License
 
