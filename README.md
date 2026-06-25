@@ -1,8 +1,25 @@
 # kv-cache-scheduler
 
+[![crates.io](https://img.shields.io/crates/v/kv-cache-scheduler.svg)](https://crates.io/crates/kv-cache-scheduler)
+
 A [PagedAttention](https://arxiv.org/abs/2309.06180)-style KV cache block manager for LLM inference, written in pure Rust.
 
 Instead of allocating contiguous memory per request, this crate manages a fixed pool of fixed-size blocks - the same idea as virtual memory paging. Multiple requests can share blocks (prefix caching), and beam search branches can fork without copying (copy-on-write).
+
+## Installation
+
+Add to your `Cargo.toml`:
+
+```toml
+[dependencies]
+kv-cache-scheduler = "0.1.0"
+```
+
+Or run:
+
+```
+cargo add kv-cache-scheduler
+```
 
 ## Features
 
