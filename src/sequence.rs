@@ -237,6 +237,15 @@ impl Scheduler {
         for block_id in &blocks {
             self.pool.decref(*block_id);
             self.eviction.on_free(block_id);
+            // A block that just dropped to ref count 0 is about to be handed
+            // back out by the free list for unrelated data — if the prefix
+            // cache still pointed at it (inserted here but never incref'd
+            // for that alone), a later match_prefix would return a block
+            // that no longer holds this sequence's KV data. Same hazard
+            // `handle_pool_full` already guards against for eviction.
+            if self.pool.is_free(*block_id) {
+                self.prefix_cache.evict(*block_id);
+            }
         }
         self.sequences.get_mut(&seq_id).unwrap().block_table.clear();
         self.sequences.get_mut(&seq_id).unwrap().state = SequenceState::Finished;

@@ -501,6 +501,24 @@ mod tests {
         assert_eq!(sched.metrics.prefix_hits, 4); // 4 tokens from 1 shared block
     }
 
+    #[test]
+    fn finished_sequence_invalidates_unshared_prefix_cache_entries() {
+        // seq_a prefills [0,1,2,3] with nobody else sharing it, then finishes -
+        // its blocks drop to ref count 0 and return to the free list. The
+        // prefix cache must not still think those (now-recycled) blocks hold
+        // seq_a's KV data, or a later match on the same tokens would hand a
+        // caller a block that's since been overwritten by something else.
+        let mut sched = Scheduler::new(2, 2);
+        let seq_a = sched.add_request(make_tokens(&[0, 1, 2, 3]));
+        sched.prefill(seq_a);
+        sched.finish_sequence(seq_a);
+
+        let hits_before = sched.metrics.prefix_hits;
+        let seq_b = sched.add_request(make_tokens(&[0, 1, 2, 3]));
+        sched.prefill(seq_b);
+        assert_eq!(sched.metrics.prefix_hits, hits_before);
+    }
+
     // --- Phase 6: Copy-on-Write tests ---
 
     #[test]
